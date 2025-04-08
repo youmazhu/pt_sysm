@@ -45,5 +45,3 @@ python main_window.py
 1. 选择输入源类型
 2. 调整置信度阈值 (0.4-0.6推荐)
 3. 点击开始检测按钮
-
-[获取完整技术白皮书](../en/technical_whitepaper.md)
