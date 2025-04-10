@@ -8,14 +8,16 @@ import threading
 class VideoDetector(QThread):
     frame_processed = pyqtSignal(object)
     detection_finished = pyqtSignal(str)
+    detection_result = pyqtSignal(object, str, float)  # 新增信号：图像、类别、置信度
     
-    def __init__(self, model_path, video_path, save_dir, conf=0.5, iou=0.45):
+    def __init__(self, model_path, video_path, save_dir, conf=0.5, iou=0.45, result_manager=None):
         super().__init__()
         self.model_path = model_path
         self.video_path = video_path
         self.save_dir = save_dir
         self.conf = conf
         self.iou = iou
+        self.result_manager = result_manager  # 添加结果管理器
         self._stop_event = threading.Event()
         self.running = True
         
@@ -56,6 +58,18 @@ class VideoDetector(QThread):
                 # 发送信号更新UI
                 self.frame_processed.emit(annotated_frame)
                 
+                # 保存检测结果到结果管理器
+                if self.result_manager and len(results[0].boxes) > 0:
+                    for box in results[0].boxes:
+                        cls_id = int(box.cls.item())
+                        conf = float(box.conf.item())
+                        class_name = results[0].names[cls_id]
+                        
+                        # 只保存置信度高于阈值的检测结果
+                        if conf >= self.conf:
+                            # 发送检测结果信号
+                            self.detection_result.emit(annotated_frame.copy(), class_name, conf)
+                
                 # 检查是否需要停止
                 if self._stop_event.is_set():
                     break
@@ -80,7 +94,7 @@ class VideoDetector(QThread):
         self.running = False
         self.wait(3000)  # 等待线程结束，最多3秒
 
-def detect_video(model_path, video_path, save_dir, conf=0.5, iou=0.45):
+def detect_video(model_path, video_path, save_dir, conf=0.5, iou=0.45, result_manager=None):
     """
     视频检测函数
     :param model_path: 模型路径
@@ -88,9 +102,10 @@ def detect_video(model_path, video_path, save_dir, conf=0.5, iou=0.45):
     :param save_dir: 结果保存目录
     :param conf: 置信度阈值
     :param iou: IOU阈值
+    :param result_manager: 检测结果管理器
     :return: VideoDetector实例
     """
-    detector = VideoDetector(model_path, video_path, save_dir, conf, iou)
+    detector = VideoDetector(model_path, video_path, save_dir, conf, iou, result_manager)
     detector.start()
     return detector
 

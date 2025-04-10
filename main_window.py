@@ -1,20 +1,114 @@
 import sys
 import cv2
+import os
+import time
+import shutil
 import numpy as np
 from collections import deque
-from PyQt5.QtWidgets import (QMainWindow, QPushButton, QFileDialog, QWidget, QLabel, QLineEdit, QTextEdit, QComboBox, QSlider, QHBoxLayout, QGridLayout)
+from datetime import datetime
+from PyQt5.QtWidgets import (QMainWindow, QPushButton, QFileDialog, QWidget, QLabel, QLineEdit, QTextEdit, QComboBox, QSlider, QHBoxLayout, QGridLayout, QVBoxLayout, QGroupBox, QListWidget, QListWidgetItem, QDesktopWidget, QScrollArea, QFrame)
 from PyQt5.QtGui import QIcon, QFont, QImage, QPixmap
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QTimer, QUrl
+from PyQt5.QtCore import QSize
+from PyQt5.QtGui import QDesktopServices
 from detect_images import detect_images
 from detect_video import detect_video
 from detect_stream import detect_stream
+from model_utils import load_model_classes, get_class_names_list
+
+# 定义检测结果管理类
+class DetectionResultManager:
+    def __init__(self, base_dir="e:\\yolov8_bicycle\\detection_results", max_images_per_class=100):
+        self.base_dir = base_dir
+        self.max_images_per_class = max_images_per_class
+        self.class_dirs = {}
+        
+    def update_class_dirs(self, class_names):
+        """根据模型类别更新目录结构"""
+        self.class_dirs = {}
+        for class_name in class_names:
+            if class_name != "全部":  # 排除"全部"选项
+                self.class_dirs[class_name] = os.path.join(self.base_dir, class_name)
+                
+        # 确保目录存在
+        for class_dir in self.class_dirs.values():
+            os.makedirs(class_dir, exist_ok=True)
+    
+    def save_detection_image(self, image, class_name, confidence):
+        """保存检测结果图片，并限制每个类别最多保存max_images_per_class张图片"""
+        if class_name not in self.class_dirs:
+            return None
+            
+        # 生成文件名：类别_置信度_时间戳.jpg
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{class_name}_{confidence:.2f}_{timestamp}.jpg"
+        save_path = os.path.join(self.class_dirs[class_name], filename)
+        
+        # 保存图片
+        cv2.imwrite(save_path, image)
+        
+        # 检查并删除多余的图片（保留最新的max_images_per_class张）
+        self._cleanup_old_images(class_name)
+        
+        return save_path
+    
+    def _cleanup_old_images(self, class_name):
+        """清理旧图片，只保留最新的max_images_per_class张"""
+        if class_name not in self.class_dirs:
+            return
+            
+        class_dir = self.class_dirs[class_name]
+        files = [os.path.join(class_dir, f) for f in os.listdir(class_dir) 
+                if f.lower().endswith(('.jpg', '.jpeg', '.png')) and os.path.isfile(os.path.join(class_dir, f))]
+        
+        # 按修改时间排序
+        files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        
+        # 删除多余的图片
+        if len(files) > self.max_images_per_class:
+            for old_file in files[self.max_images_per_class:]:
+                try:
+                    os.remove(old_file)
+                except Exception as e:
+                    print(f"删除旧图片失败: {str(e)}")
+    
+    def get_images_by_class(self, class_name=None):
+        """获取指定类别的所有图片路径，如果class_name为None则返回所有图片"""
+        result = []
+        
+        if class_name is not None and class_name != "全部":
+            if class_name in self.class_dirs:
+                class_dir = self.class_dirs[class_name]
+                files = [os.path.join(class_dir, f) for f in os.listdir(class_dir) 
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png')) and os.path.isfile(os.path.join(class_dir, f))]
+                # 按修改时间排序（最新的在前）
+                files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                result.extend(files)
+        else:
+            # 返回所有类别的图片
+            for class_name in self.class_dirs:
+                result.extend(self.get_images_by_class(class_name))
+                
+        return result
 
 class DetectionApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setup_style()
         self.statusBar().showMessage('就绪')  # 初始化状态栏
+        
+        # 初始化检测结果管理器
+        self.result_manager = DetectionResultManager()
+        
+        # 初始化检测结果存储
+        self.detection_results = {}
+        
         self.initUI()
+        
+        # 加载默认模型的类别信息
+        default_model_path = self.model_path.text()
+        if os.path.exists(default_model_path):
+            self.load_model_classes(default_model_path)
 
     def setup_style(self):
         self.setStyleSheet('''
@@ -113,7 +207,7 @@ class DetectionApp(QMainWindow):
         
     def initUI(self):
         self.setWindowTitle('权重检测系统')
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1400, 900)
 
         # 创建主布局
         main_widget = QWidget()
@@ -296,6 +390,63 @@ class DetectionApp(QMainWindow):
         video_group.setLayout(video_layout)
         right_layout.addWidget(video_group)
         
+        # 添加检测结果显示区域
+        detection_group = QGroupBox("检测结果")
+        detection_layout = QHBoxLayout()
+        
+        # 左侧：检测结果列表
+        results_layout = QVBoxLayout()
+        
+        # 添加类别筛选下拉框
+        filter_layout = QHBoxLayout()
+        filter_label = QLabel("筛选类别:")
+        self.class_filter = QComboBox()
+        self.class_filter.addItems(["全部", "motorcycle", "person", "bicycle", "gas_tank"])
+        self.class_filter.currentTextChanged.connect(self.filter_detection_results)
+        filter_layout.addWidget(filter_label)
+        filter_layout.addWidget(self.class_filter)
+        results_layout.addLayout(filter_layout)
+        
+        # 添加检测结果列表
+        self.results_list = QListWidget()
+        self.results_list.setMinimumWidth(300)
+        self.results_list.setStyleSheet('background-color: #313244; color: #CDD6F4; border-radius: 6px;')
+        self.results_list.itemClicked.connect(self.show_detection_detail)
+        results_layout.addWidget(self.results_list)
+        
+        # 添加统计信息
+        self.stats_label = QLabel("检测统计: 0个结果")
+        results_layout.addWidget(self.stats_label)
+        
+        # 右侧：检测结果详情
+        detail_layout = QVBoxLayout()
+        
+        # 添加详情标签
+        self.detail_label = QLabel("选择一个检测结果查看详情")
+        self.detail_label.setAlignment(Qt.AlignCenter)
+        self.detail_label.setStyleSheet('background-color: #313244; color: #CDD6F4; padding: 10px; border-radius: 6px;')
+        detail_layout.addWidget(self.detail_label)
+        
+        # 添加图片预览
+        self.detail_image = QLabel()
+        self.detail_image.setMinimumSize(320, 240)
+        self.detail_image.setAlignment(Qt.AlignCenter)
+        self.detail_image.setStyleSheet('background-color: #1A1826; color: #BAC2DE; border-radius: 6px;')
+        self.detail_image.setText("选择检测结果查看图片")
+        detail_layout.addWidget(self.detail_image)
+        
+        # 添加打开文件夹按钮
+        self.btn_open_folder = QPushButton("打开图片所在文件夹")
+        self.btn_open_folder.clicked.connect(self.open_result_folder)
+        detail_layout.addWidget(self.btn_open_folder)
+        
+        # 将左右两侧添加到检测结果布局
+        detection_layout.addLayout(results_layout, 1)
+        detection_layout.addLayout(detail_layout, 2)
+        
+        detection_group.setLayout(detection_layout)
+        right_layout.addWidget(detection_group)
+        
         # 设置左右面板的比例
         main_layout.addWidget(left_panel, 1)
         main_layout.addWidget(right_panel, 2)
@@ -310,6 +461,8 @@ class DetectionApp(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, '选择模型文件', '', '模型文件 (*.pt)')
         if path:
             self.model_path.setText(path)
+            # 加载模型类别信息并更新UI
+            self.load_model_classes(path)
 
     def select_source_dir(self):
         dir_path = QFileDialog.getExistingDirectory(self, '选择图片目录')
@@ -451,6 +604,25 @@ class DetectionApp(QMainWindow):
             Qt.KeepAspectRatio
         ))
         
+    def handle_detection_result(self, image, class_name, confidence):
+        """处理检测结果，保存图像并更新UI"""
+        try:
+            # 保存检测结果图像
+            save_path = self.result_manager.save_detection_image(image, class_name, confidence)
+            if save_path:
+                # 如果当前筛选的类别与检测结果类别相同，或者选择了"全部"，则更新UI
+                current_filter = self.class_filter.currentText()
+                if current_filter == "全部" or current_filter == class_name:
+                    # 创建列表项
+                    item = QListWidgetItem(f"{class_name} - 置信度: {confidence:.2f}")
+                    item.setData(Qt.UserRole, save_path)  # 存储图片路径
+                    self.results_list.insertItem(0, item)  # 在列表顶部插入新项
+                    
+                    # 更新统计信息
+                    self.stats_label.setText(f"检测统计: {self.results_list.count()}个结果")
+        except Exception as e:
+            self.log.append(f"保存检测结果失败: {str(e)}")
+        
     def stop_detection(self):
         """停止当前检测过程"""
         try:
@@ -499,11 +671,14 @@ class DetectionApp(QMainWindow):
                     video_path=self.video_path.text(),
                     save_dir=self.save_dir.text(),
                     conf=self.conf_slider.value()/100,
-                    iou=self.iou_slider.value()/100
+                    iou=self.iou_slider.value()/100,
+                    result_manager=self.result_manager
                 )
                 # 连接信号
                 self.video_detector.frame_processed.connect(self.update_video_frame)
                 self.video_detector.detection_finished.connect(self.log.append)
+                # 连接检测结果信号
+                self.video_detector.detection_result.connect(self.handle_detection_result)
                 
                 # 显示停止按钮，隐藏开始按钮
                 self.btn_start.setVisible(False)
@@ -516,10 +691,12 @@ class DetectionApp(QMainWindow):
                     stream_url=self.stream_url.text(),
                     save_dir=self.save_dir.text(),
                     conf=self.conf_slider.value()/100,
-                    iou=self.iou_slider.value()/100
+                    iou=self.iou_slider.value()/100,
+                    result_manager=self.result_manager
                 )
                 if self.video_thread:
                     self.video_thread.detector.frame_processed.connect(self.update_video_frame)
+                    self.video_thread.detector.detection_result.connect(self.handle_detection_result)
                     self.video_thread.finished.connect(lambda: self.log.append('检测线程安全退出'))
                     
                     # 显示停止按钮，隐藏开始按钮
@@ -561,13 +738,114 @@ class DetectionApp(QMainWindow):
             self.log.append('检测完成！结果已保存到：' + self.save_dir.text())
         except Exception as e:
             self.log.append(f'错误: {str(e)}')
+            
+    def load_model_classes(self, model_path):
+        """加载模型类别信息并更新UI"""
+        try:
+            # 获取模型类别名称列表
+            class_names = get_class_names_list(model_path)
+            
+            if class_names:
+                # 更新类别筛选下拉框
+                self.class_filter.clear()
+                self.class_filter.addItems(class_names)
+                
+                # 更新检测结果管理器的类别目录
+                self.result_manager.update_class_dirs([name for name in class_names if name != "全部"])
+                
+                self.log.append(f"已加载模型类别信息: {', '.join([name for name in class_names if name != '全部'])}")
+            else:
+                self.log.append("未能从模型中读取类别信息，使用默认类别")
+                # 使用默认类别
+                default_classes = ["全部", "motorcycle", "person", "bicycle", "gas_tank"]
+                self.class_filter.clear()
+                self.class_filter.addItems(default_classes)
+                self.result_manager.update_class_dirs([name for name in default_classes if name != "全部"])
+        except Exception as e:
+            self.log.append(f"加载模型类别信息失败: {str(e)}")
 
-if __name__ == '__main__':
-    from PyQt5.QtWidgets import QApplication
-    app = QApplication(sys.argv)
-    exe = DetectionApp()
-    exe.show()
-    sys.exit(app.exec_())
+    def filter_detection_results(self, class_name):
+        """根据选择的类别筛选检测结果"""
+        try:
+            # 获取指定类别的图片
+            filtered_images = self.result_manager.get_images_by_class(class_name if class_name != "全部" else None)
+            
+            # 清空结果列表
+            self.results_list.clear()
+            
+            # 添加筛选后的结果到列表
+            for img_path in filtered_images:
+                # 从文件名中提取信息
+                filename = os.path.basename(img_path)
+                parts = filename.split('_')
+                if len(parts) >= 2:
+                    class_name = parts[0]
+                    confidence = float(parts[1]) if len(parts) > 1 else 0.0
+                    timestamp = '_'.join(parts[2:]).replace('.jpg', '') if len(parts) > 2 else ''
+                    
+                    # 创建列表项
+                    item = QListWidgetItem(f"{class_name} - 置信度: {confidence:.2f}")
+                    item.setData(Qt.UserRole, img_path)  # 存储图片路径
+                    self.results_list.addItem(item)
+            
+            # 更新统计信息
+            self.stats_label.setText(f"检测统计: {self.results_list.count()}个结果")
+        except Exception as e:
+            self.log.append(f"筛选检测结果失败: {str(e)}")
+
+    def show_detection_detail(self, item):
+        """显示选中检测结果的详细信息"""
+        try:
+            # 获取图片路径
+            img_path = item.data(Qt.UserRole)
+            if not img_path or not os.path.exists(img_path):
+                self.detail_label.setText("图片文件不存在")
+                return
+                
+            # 从文件名中提取信息
+            filename = os.path.basename(img_path)
+            parts = filename.split('_')
+            if len(parts) >= 2:
+                class_name = parts[0]
+                confidence = float(parts[1]) if len(parts) > 1 else 0.0
+                timestamp = '_'.join(parts[2:]).replace('.jpg', '') if len(parts) > 2 else ''
+                
+                # 设置详情标签
+                detail_text = f"类别: {class_name}\n置信度: {confidence:.2f}\n时间戳: {timestamp}"
+                self.detail_label.setText(detail_text)
+                
+                # 显示图片
+                img = cv2.imread(img_path)
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    h, w, ch = img.shape
+                    bytes_per_line = ch * w
+                    q_img = QImage(img.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                    self.detail_image.setPixmap(QPixmap.fromImage(q_img).scaled(
+                        self.detail_image.width(), self.detail_image.height(), 
+                        Qt.KeepAspectRatio))
+                else:
+                    self.detail_image.setText("无法加载图片")
+        except Exception as e:
+            self.log.append(f"显示检测详情失败: {str(e)}")
+
+    def open_result_folder(self):
+        """打开检测结果所在文件夹"""
+        try:
+            # 获取当前选中的图片路径
+            current_item = self.results_list.currentItem()
+            if current_item:
+                img_path = current_item.data(Qt.UserRole)
+                if img_path and os.path.exists(img_path):
+                    # 打开文件所在文件夹
+                    folder_path = os.path.dirname(img_path)
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(folder_path))
+                    return
+                    
+            # 如果没有选中项或文件不存在，打开结果根目录
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.result_manager.base_dir))
+        except Exception as e:
+            self.log.append(f"打开文件夹失败: {str(e)}")
 
 
 class VideoThread(QThread):
@@ -589,7 +867,9 @@ class VideoThread(QThread):
                 self.frame_signal.emit(frame)
 
 
-# 在UI初始化部分添加
-self.video_thread = VideoThread(self.video_thread)
-self.video_thread.frame_signal.connect(self.update_video_frame)
-QTimer.singleShot(0, self.video_thread.start)
+if __name__ == '__main__':
+    from PyQt5.QtWidgets import QApplication
+    app = QApplication(sys.argv)
+    exe = DetectionApp()
+    exe.show()
+    sys.exit(app.exec_())

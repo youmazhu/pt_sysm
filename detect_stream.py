@@ -8,8 +8,9 @@ from PyQt5.QtCore import QObject, pyqtSignal, QMutex, QMutexLocker
 from collections import deque
 class StreamDetector(QObject):
     frame_processed = pyqtSignal(np.ndarray)
+    detection_result = pyqtSignal(object, str, float)  # 新增信号：图像、类别、置信度
 
-    def __init__(self, model_path: str, stream_url: str, save_dir: str, conf: float = 0.5, iou: float = 0.45):
+    def __init__(self, model_path: str, stream_url: str, save_dir: str, conf: float = 0.5, iou: float = 0.45, result_manager=None):
         super().__init__()
         self.frame_queue = deque(maxlen=25)
         self.queue_lock = QMutex()
@@ -18,6 +19,7 @@ class StreamDetector(QObject):
         self.save_dir = save_dir
         self.conf = conf
         self.iou = iou
+        self.result_manager = result_manager  # 添加结果管理器
         self.cap = None
         self.model = None
         self.last_frame_time = 0
@@ -122,6 +124,22 @@ class StreamDetector(QObject):
                 plotted_frame = results[0].plot()
                 plotted_frame = cv2.cvtColor(plotted_frame, cv2.COLOR_BGR2RGB)
                 
+                # 保存检测结果到结果管理器
+                if self.result_manager and hasattr(results[0], 'boxes') and results[0].boxes is not None:
+                    boxes = results[0].boxes
+                    if len(boxes) > 0:
+                        for box in boxes:
+                            cls_id = int(box.cls.item())
+                            conf = float(box.conf.item())
+                            class_name = results[0].names[cls_id]
+                            
+                            # 只保存置信度高于阈值的检测结果
+                            if conf >= self.conf:
+                                # 发送检测结果信号
+                                # 使用BGR格式的帧进行保存
+                                bgr_frame = cv2.cvtColor(plotted_frame.copy(), cv2.COLOR_RGB2BGR)
+                                self.detection_result.emit(bgr_frame, class_name, conf)
+                
                 with QMutexLocker(self.queue_lock):
                     self.frame_queue.append(plotted_frame)
                 self.frame_processed.emit(plotted_frame)
@@ -159,7 +177,7 @@ class StreamDetector(QObject):
         return False
 
 
-def detect_stream(model_path: str, stream_url: str, save_dir: str, conf: float = 0.5, iou: float = 0.45):
+def detect_stream(model_path: str, stream_url: str, save_dir: str, conf: float = 0.5, iou: float = 0.45, result_manager=None):
     from PyQt5.QtCore import QThread
     
     class StreamThread(QThread):
@@ -175,7 +193,7 @@ def detect_stream(model_path: str, stream_url: str, save_dir: str, conf: float =
             self.quit()
             self.wait(1000)
     
-    detector = StreamDetector(model_path, stream_url, save_dir, conf, iou)
+    detector = StreamDetector(model_path, stream_url, save_dir, conf, iou, result_manager)
     if detector.connect_stream():
         print(f"成功连接视频流: {stream_url}")
         thread = StreamThread(detector)
